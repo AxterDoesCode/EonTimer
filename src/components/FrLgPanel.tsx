@@ -10,10 +10,10 @@ const FRAME_ADVANCES = 600;
 // Duration to hold A when opening the continue screen (ms)
 const A_HOLD_MS = 1500;
 // Fixed navigation time after selecting save game:
-//   A 0.1s + 0.8s wait + B 0.1s + 0.8s wait = 1800ms
+//   A 0.1s + 0.8s wait + B 0.1s + 3s wait = 4000ms
 //   A 0.3s + 1s + A 0.3s + 1s + A 0.3s = 2900ms
-//   Total: 4700ms
-const NAV_DURATION_MS = 4700;
+//   Total: 6900ms
+const NAV_DURATION_MS = 6900;
 
 function formatSeconds(ms: number): string {
   const str = (ms / 1000).toFixed(3);
@@ -65,7 +65,7 @@ function generateMacro(
     ``,
     `# Skip previously on screen`,
     `B 0.1s`,
-    `0.8s`,
+    `3s`,
     ``,
     `# Navigate to starter dialog`,
     `A 0.3s`,
