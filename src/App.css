@@ -720,6 +720,47 @@ input[type='checkbox'] {
   flex: 1;
 }
 
+/* ─── FR/LG panel ─── */
+.frlg-panel {
+  gap: 8px;
+}
+
+.frlg-macro-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 6px;
+}
+
+.frlg-macro-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.frlg-macro-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+}
+
+.frlg-macro-output {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px;
+  border: 1px solid var(--color-input-border);
+  border-radius: 3px;
+  background: var(--color-scroll-bg);
+  color: var(--color-text);
+  outline: none;
+}
+
 /* ─── Settings dialog ─── */
 .dialog-overlay {
   position: fixed;

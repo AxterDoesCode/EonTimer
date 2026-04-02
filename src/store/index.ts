@@ -70,6 +70,13 @@ export interface Gen3Settings {
   calibration: number;
 }
 
+export interface FrLgSettings {
+  seedMs: number;
+  seedCalibration: number;
+  continueAdvances: number;
+  continueCalibration: number;
+}
+
 export interface ActionSettings {
   mode: ActionMode;
   sound: ActionSound;
@@ -95,6 +102,7 @@ export interface SettingsState {
   gen5: Gen5Settings;
   gen4: Gen4Settings;
   gen3: Gen3Settings;
+  frlg: FrLgSettings;
   custom: { phases: CustomPhase[] };
   tabIndex: number;
   theme: Theme;
@@ -104,6 +112,7 @@ export interface SettingsState {
   updateGen5: (patch: Partial<Gen5Settings>) => void;
   updateGen4: (patch: Partial<Gen4Settings>) => void;
   updateGen3: (patch: Partial<Gen3Settings>) => void;
+  updateFrLg: (patch: Partial<FrLgSettings>) => void;
   setCustomPhases: (phases: CustomPhase[]) => void;
   setTabIndex: (index: number) => void;
   setTheme: (theme: Theme) => void;
@@ -153,6 +162,13 @@ export const DEFAULT_GEN3: Gen3Settings = {
   calibration: 0,
 };
 
+export const DEFAULT_FRLG: FrLgSettings = {
+  seedMs: 30441,
+  seedCalibration: 0,
+  continueAdvances: 1987,
+  continueCalibration: 0,
+};
+
 export const useSettingsStore = create<SettingsState>()(
   persist(
     (set) => ({
@@ -161,6 +177,7 @@ export const useSettingsStore = create<SettingsState>()(
       gen5: { ...DEFAULT_GEN5 },
       gen4: { ...DEFAULT_GEN4 },
       gen3: { ...DEFAULT_GEN3 },
+      frlg: { ...DEFAULT_FRLG },
       custom: { phases: [] },
       tabIndex: 0,
       theme: Theme.SYSTEM,
@@ -170,6 +187,7 @@ export const useSettingsStore = create<SettingsState>()(
       updateGen5: (patch) => set((s) => ({ gen5: { ...s.gen5, ...patch } })),
       updateGen4: (patch) => set((s) => ({ gen4: { ...s.gen4, ...patch } })),
       updateGen3: (patch) => set((s) => ({ gen3: { ...s.gen3, ...patch } })),
+      updateFrLg: (patch) => set((s) => ({ frlg: { ...s.frlg, ...patch } })),
       setCustomPhases: (phases) => set({ custom: { phases } }),
       setTabIndex: (index) => set({ tabIndex: index }),
       setTheme: (theme) => set({ theme }),
@@ -180,6 +198,7 @@ export const useSettingsStore = create<SettingsState>()(
           gen5: { ...DEFAULT_GEN5 },
           gen4: { ...DEFAULT_GEN4 },
           gen3: { ...DEFAULT_GEN3 },
+          frlg: { ...DEFAULT_FRLG },
           custom: { phases: [] },
           tabIndex: 0,
           theme: Theme.SYSTEM,
@@ -197,6 +216,7 @@ export const useSettingsStore = create<SettingsState>()(
           gen5: { ...current.gen5, ...p.gen5 },
           gen4: { ...current.gen4, ...p.gen4 },
           gen3: { ...current.gen3, ...p.gen3 },
+          frlg: { ...current.frlg, ...p.frlg },
         };
       },
     },

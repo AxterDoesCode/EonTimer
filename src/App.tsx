@@ -10,15 +10,17 @@ import { Gen5Panel } from './components/Gen5Panel';
 import type { TimerPanelHandle } from './components/timerPanel';
 import { Gen4Panel } from './components/Gen4Panel';
 import { Gen3Panel } from './components/Gen3Panel';
+import { FrLgPanel } from './components/FrLgPanel';
 import { CustomPanel } from './components/CustomPanel';
 import { SettingsDialog } from './components/SettingsDialog';
 import './App.css';
 
-const TAB_LABELS = ['Gen 5', 'Gen 4', 'Gen 3', 'Custom'];
+const TAB_LABELS = ['Gen 5', 'Gen 4', 'Gen 3', 'FR/LG', 'Custom'];
 const TAB_TOOLTIPS = [
   'Black / White / Black 2 / White 2',
   'Diamond / Pearl / Platinum / HeartGold / SoulSilver',
   'Ruby / Sapphire / Emerald / FireRed / LeafGreen',
+  'FireRed / LeafGreen shiny starter — generates NXBT macro',
   'Define your own phase sequence',
 ];
 
@@ -36,9 +38,10 @@ export default function App() {
   const gen5Ref = useRef<TimerPanelHandle>(null);
   const gen4Ref = useRef<TimerPanelHandle>(null);
   const gen3Ref = useRef<TimerPanelHandle>(null);
+  const frlgRef = useRef<TimerPanelHandle>(null);
   const customRef = useRef<TimerPanelHandle>(null);
 
-  const refs = useMemo(() => [gen5Ref, gen4Ref, gen3Ref, customRef], []);
+  const refs = useMemo(() => [gen5Ref, gen4Ref, gen3Ref, frlgRef, customRef], []);
   const currentRef = refs[tabIndex];
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -248,6 +251,15 @@ export default function App() {
             <div
               style={{
                 display: tabIndex === 3 ? 'flex' : 'none',
+                flex: 1,
+                flexDirection: 'column',
+              }}
+            >
+              <FrLgPanel ref={frlgRef} onPhasesChange={updatePhases} disabled={running} />
+            </div>
+            <div
+              style={{
+                display: tabIndex === 4 ? 'flex' : 'none',
                 flex: 1,
                 flexDirection: 'column',
               }}
