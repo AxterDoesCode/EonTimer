@@ -49,7 +49,7 @@ function generateMacro(
     `A 0.1s`,
     `1.5s`,
     `HOME 0.1s`,
-    `2s`,
+    `20s`,
     ``,
     `# >>> Start EonTimer now + press A to enter game <<<`,
     `A 0.1s`,
