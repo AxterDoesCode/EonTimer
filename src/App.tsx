@@ -255,7 +255,7 @@ export default function App() {
                 flexDirection: 'column',
               }}
             >
-              <FrLgPanel ref={frlgRef} onPhasesChange={updatePhases} disabled={running} />
+              <FrLgPanel ref={frlgRef} onPhasesChange={updatePhases} disabled={running} onTrigger={toggle} />
             </div>
             <div
               style={{

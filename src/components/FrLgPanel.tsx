@@ -5,10 +5,12 @@ import { FormField } from './common/FormField';
 import { IntInput } from './common/IntInput';
 import { FloatInput } from './common/FloatInput';
 import type { TimerPanelHandle } from './timerPanel';
+import { useEsp32 } from '../hooks/useEsp32';
+import type { Esp32Status } from '../hooks/useEsp32';
 
 const FRAME_ADVANCES = 600;
 // Duration to hold A when opening the continue screen (ms)
-const A_HOLD_MS = 1500;
+const A_HOLD_MS = 3000;
 // Fixed navigation time after selecting save game:
 //   A 0.1s + 0.8s wait + B 0.1s + 3s wait = 4000ms
 //   A 0.3s + 1s + A 0.3s + 1s + A 0.3s = 2900ms
@@ -80,13 +82,32 @@ function generateMacro(
   ].join('\n');
 }
 
+const STATUS_LABELS: Record<Esp32Status, string> = {
+  disconnected: 'Disconnected',
+  connecting: 'Connecting...',
+  connected: 'Connected (BLE not paired)',
+  ble_connected: 'BLE Connected',
+  ble_disconnected: 'BLE Disconnected',
+  error: 'Connection error',
+};
+
+const STATUS_COLORS: Record<Esp32Status, string> = {
+  disconnected: 'var(--color-text-muted)',
+  connecting: '#f0b429',
+  connected: 'var(--color-accent)',
+  ble_connected: '#38a169',
+  ble_disconnected: '#dd6b20',
+  error: 'var(--color-danger)',
+};
+
 interface FrLgPanelProps {
   onPhasesChange: () => void;
   disabled?: boolean;
+  onTrigger?: () => void;
 }
 
 export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function FrLgPanel(
-  { onPhasesChange, disabled },
+  { onPhasesChange, disabled, onTrigger },
   ref,
 ) {
   const frlg = useSettingsStore((s) => s.frlg);
@@ -95,6 +116,10 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
   const [continueHit, setContinueHit] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
   const [copiedCli, setCopiedCli] = useState(false);
+  const [urlDraft, setUrlDraft] = useState(frlg.esp32Url);
+
+  const { status, connect, disconnect, sendConfig, trigger } = useEsp32();
+  const isConnected = status === 'connected' || status === 'ble_connected' || status === 'ble_disconnected';
 
   const macro = useMemo(
     () => generateMacro(frlg.seedMs, frlg.seedCalibration, frlg.continueAdvances, frlg.continueCalibration),
@@ -131,8 +156,9 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
       setContinueHit(null);
     }
     updateFrLg(patch);
+    sendConfig({ ...frlg, ...patch });
     setTimeout(onPhasesChange, 0);
-  }, [frlg, seedHit, continueHit, updateFrLg, onPhasesChange]);
+  }, [frlg, seedHit, continueHit, updateFrLg, onPhasesChange, sendConfig]);
 
   const reset = useCallback(() => {
     updateFrLg({ ...DEFAULT_FRLG });
@@ -169,6 +195,16 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
       setTimeout(() => setCopiedCli(false), 2000);
     });
   }, [cliMacro]);
+
+  const handleConnect = useCallback(() => {
+    updateFrLg({ esp32Url: urlDraft });
+    connect(urlDraft);
+  }, [urlDraft, connect, updateFrLg]);
+
+  const handleTrigger = useCallback(() => {
+    trigger();
+    onTrigger?.();
+  }, [trigger, onTrigger]);
 
   return (
     <div className="timer-panel frlg-panel">
@@ -235,6 +271,42 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
             disabled={disabled}
           />
         </FormField>
+      </div>
+      <div className="frlg-esp32-section">
+        <span className="frlg-esp32-header">ESP32 Controller</span>
+        <div className="frlg-esp32-url-row">
+          <input
+            type="text"
+            className="frlg-esp32-url-input"
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            placeholder="ws://192.168.1.x/ws"
+            disabled={isConnected || status === 'connecting'}
+            spellCheck={false}
+          />
+          <button
+            className="btn"
+            onClick={isConnected ? disconnect : handleConnect}
+            disabled={status === 'connecting'}
+          >
+            {isConnected ? 'Disconnect' : 'Connect'}
+          </button>
+        </div>
+        <div className="frlg-esp32-status">
+          <span
+            className="frlg-esp32-status-dot"
+            style={{ background: STATUS_COLORS[status] }}
+          />
+          {STATUS_LABELS[status]}
+        </div>
+        <button
+          className="btn frlg-esp32-trigger"
+          onClick={handleTrigger}
+          disabled={status !== 'ble_connected' || disabled}
+        >
+          Trigger + Start EonTimer
+        </button>
+        <span className="frlg-esp32-note">Requires HTTP origin — use npm run dev</span>
       </div>
       <div className="frlg-macro-section">
         <div className="frlg-macro-header">

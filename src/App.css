@@ -761,6 +761,69 @@ input[type='checkbox'] {
   outline: none;
 }
 
+/* ─── FR/LG ESP32 section ─── */
+.frlg-esp32-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--color-scroll-border);
+  border-radius: 4px;
+  background: var(--color-scroll-bg);
+  padding: 8px;
+}
+
+.frlg-esp32-header {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+}
+
+.frlg-esp32-url-row {
+  display: flex;
+  gap: 6px;
+}
+
+.frlg-esp32-url-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--color-input-border);
+  border-radius: 3px;
+  background: var(--color-input-bg);
+  color: var(--color-text);
+  outline: none;
+}
+
+.frlg-esp32-url-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.frlg-esp32-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.frlg-esp32-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.frlg-esp32-trigger {
+  width: 100%;
+}
+
+.frlg-esp32-note {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
 /* ─── Settings dialog ─── */
 .dialog-overlay {
   position: fixed;

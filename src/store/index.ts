@@ -75,6 +75,7 @@ export interface FrLgSettings {
   seedCalibration: number;
   continueAdvances: number;
   continueCalibration: number;
+  esp32Url: string;
 }
 
 export interface ActionSettings {
@@ -167,6 +168,7 @@ export const DEFAULT_FRLG: FrLgSettings = {
   seedCalibration: 0,
   continueAdvances: 1987,
   continueCalibration: 0,
+  esp32Url: 'ws://192.168.1.x/ws',
 };
 
 export const useSettingsStore = create<SettingsState>()(
