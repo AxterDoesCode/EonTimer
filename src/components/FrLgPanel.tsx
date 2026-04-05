@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
+import { useState, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
 import { useSettingsStore, DEFAULT_FRLG } from '../store';
 import { GBA_MS_PER_FRAME, INT_MAX, INT_MIN } from '../utils/constants';
 import { FormField } from './common/FormField';
@@ -85,7 +85,7 @@ function generateMacro(
 const STATUS_LABELS: Record<Esp32Status, string> = {
   disconnected: 'Disconnected',
   connecting: 'Connecting...',
-  connected: 'Connected (BLE not paired)',
+  connected: 'Connected (BLE not paired yet)',
   ble_connected: 'BLE Connected',
   ble_disconnected: 'BLE Disconnected',
   error: 'Connection error',
@@ -116,9 +116,8 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
   const [continueHit, setContinueHit] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
   const [copiedCli, setCopiedCli] = useState(false);
-  const [urlDraft, setUrlDraft] = useState(frlg.esp32Url);
 
-  const { status, connect, disconnect, sendConfig, trigger } = useEsp32();
+  const { status, connect, disconnect, sendConfig, trigger, onPhase1Start } = useEsp32();
   const isConnected = status === 'connected' || status === 'ble_connected' || status === 'ble_disconnected';
 
   const macro = useMemo(
@@ -197,14 +196,20 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
   }, [cliMacro]);
 
   const handleConnect = useCallback(() => {
-    updateFrLg({ esp32Url: urlDraft });
-    connect(urlDraft);
-  }, [urlDraft, connect, updateFrLg]);
+    connect();
+  }, [connect]);
+
+  // Register the EonTimer start callback — fires when ESP32 signals phase1_start
+  // (i.e. the moment it presses A to enter the game, after the ~22s setup sequence)
+  useEffect(() => {
+    onPhase1Start(onTrigger ?? null);
+    return () => onPhase1Start(null);
+  }, [onPhase1Start, onTrigger]);
 
   const handleTrigger = useCallback(() => {
     trigger();
-    onTrigger?.();
-  }, [trigger, onTrigger]);
+    // EonTimer starts via phase1_start signal from ESP32, not here
+  }, [trigger]);
 
   return (
     <div className="timer-panel frlg-panel">
@@ -275,21 +280,13 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
       <div className="frlg-esp32-section">
         <span className="frlg-esp32-header">ESP32 Controller</span>
         <div className="frlg-esp32-url-row">
-          <input
-            type="text"
-            className="frlg-esp32-url-input"
-            value={urlDraft}
-            onChange={(e) => setUrlDraft(e.target.value)}
-            placeholder="ws://192.168.1.x/ws"
-            disabled={isConnected || status === 'connecting'}
-            spellCheck={false}
-          />
           <button
             className="btn"
             onClick={isConnected ? disconnect : handleConnect}
             disabled={status === 'connecting'}
+            style={{ flex: 1 }}
           >
-            {isConnected ? 'Disconnect' : 'Connect'}
+            {isConnected ? 'Disconnect' : 'Connect via USB Serial'}
           </button>
         </div>
         <div className="frlg-esp32-status">
@@ -306,7 +303,7 @@ export const FrLgPanel = forwardRef<TimerPanelHandle, FrLgPanelProps>(function F
         >
           Trigger + Start EonTimer
         </button>
-        <span className="frlg-esp32-note">Requires HTTP origin — use npm run dev</span>
+        <span className="frlg-esp32-note">Requires Chrome or Edge (Web Serial API)</span>
       </div>
       <div className="frlg-macro-section">
         <div className="frlg-macro-header">

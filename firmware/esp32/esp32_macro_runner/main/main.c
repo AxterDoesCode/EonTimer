@@ -2,7 +2,7 @@
  * esp32_macro_runner/main/main.c
  *
  * Nintendo Switch Pro Controller emulation over Classic Bluetooth HID.
- * Receives timing config from EonTimer via WiFi WebSocket and executes
+ * Receives timing config from EonTimer via USB Serial (UART0) and executes
  * the FireRed/LeafGreen shiny starter RNG macro with hardware-timer precision.
  *
  * Classic BT HID implementation based on UARTSwitchCon (GPL-3.0):
@@ -19,19 +19,19 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_bt.h"
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
 #include "esp_err.h"
-#include "esp_event.h"
 #include "esp_gap_bt_api.h"
 #include "esp_hidd_api.h"
-#include "esp_http_server.h"
 #include "esp_log.h"
-#include "esp_netif.h"
+#include "esp_log_buffer.h"
+#include "esp_mac.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -39,22 +39,20 @@
 #include "nvs_flash.h"
 #include "cJSON.h"
 
-// ---------------------------------------------------------------------------
-// USER CONFIG — edit before flashing
-// ---------------------------------------------------------------------------
-#define WIFI_SSID "YOUR_SSID"
-#define WIFI_PASS "YOUR_PASSWORD"
-// ---------------------------------------------------------------------------
-
 #define TAG_MAIN    "main"
 #define TAG_BT      "bt"
-#define TAG_WS      "ws"
+#define TAG_UART    "uart"
 #define TAG_MACRO   "macro"
 
 // GPIO
 #define LED_GPIO     2
 #define TRIGGER_GPIO 0   // boot button on most ESP32 devboards (active LOW)
 #define PIN_SEL      (1ULL << LED_GPIO)
+
+// UART
+#define UART_PORT    UART_NUM_0
+#define UART_BAUD    115200
+#define UART_RX_BUF  512
 
 // Controller type: Pro Controller = 0x03
 #define PRO_CON      0x03
@@ -83,9 +81,6 @@
 #define A_HOLD_MS         3000
 #define NAV_DURATION_MS   6900
 
-// WebSocket
-#define MAX_WS_CLIENTS 4
-
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -103,8 +98,8 @@ static uint8_t timer_byte = 0;
 static SemaphoreHandle_t xBtnSem;
 
 // BT state
-static bool bt_connected  = false;
-static bool bt_paired     = false;
+static volatile bool bt_connected  = false;
+static volatile bool bt_paired     = false;
 static TaskHandle_t SendingHandle = NULL;
 static TaskHandle_t BlinkHandle  = NULL;
 
@@ -128,11 +123,8 @@ static macro_config_t g_config = {
 };
 static SemaphoreHandle_t xCfgSem;
 
-// WebSocket client tracking
-static httpd_handle_t g_server = NULL;
-static int ws_fds[MAX_WS_CLIENTS];
-static int ws_fd_count = 0;
-static SemaphoreHandle_t xWsSem;
+// Serial output mutex (prevents log and status lines from interleaving)
+static SemaphoreHandle_t xUartTxSem;
 
 // ---------------------------------------------------------------------------
 // HID descriptor (from UARTSwitchCon / Nintendo Switch Pro Controller)
@@ -353,12 +345,23 @@ static void buttons_release_all(void) {
 }
 
 // ---------------------------------------------------------------------------
-// HID send task — sends report30 every 15 ms
+// Serial status broadcast
+// ---------------------------------------------------------------------------
+static void serial_send_status(const char *state) {
+    char buf[80];
+    int len = snprintf(buf, sizeof(buf), "{\"type\":\"status\",\"state\":\"%s\"}\n", state);
+    xSemaphoreTake(xUartTxSem, portMAX_DELAY);
+    uart_write_bytes(UART_PORT, buf, len);
+    xSemaphoreGive(xUartTxSem);
+}
+
+// ---------------------------------------------------------------------------
+// HID send task — sends report30 every 15 ms (core 0, dedicated to BT)
 // ---------------------------------------------------------------------------
 static void send_buttons(void) {
     xSemaphoreTake(xBtnSem, portMAX_DELAY);
-    report30[0] = timer_byte++;
-    if (timer_byte == 255) timer_byte = 0;
+    report30[0] = timer_byte;
+    timer_byte = (timer_byte + 3) & 0xFF;  // Pro Controller increments by 3 per 15ms
     report30[2] = but1_send;
     report30[3] = but2_send;
     report30[4] = but3_send;
@@ -372,9 +375,14 @@ static void send_buttons(void) {
     xSemaphoreGive(xBtnSem);
 
     if (bt_connected) {
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                                   sizeof(report30), report30);
-        vTaskDelay(pdMS_TO_TICKS(15));
+        esp_err_t err = esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                                      sizeof(report30), report30);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG_BT, "send_report failed: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(50));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(15));
+        }
     } else {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -388,7 +396,7 @@ static void send_task(void *pvParameters) {
 }
 
 // ---------------------------------------------------------------------------
-// LED blink task
+// LED blink task (advertising)
 // ---------------------------------------------------------------------------
 static void blink_task(void *pvParameters) {
     while (1) {
@@ -397,46 +405,6 @@ static void blink_task(void *pvParameters) {
         gpio_set_level(LED_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(150));
         gpio_set_level(LED_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(1000));
     }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket broadcast
-// ---------------------------------------------------------------------------
-static void ws_broadcast(const char *msg) {
-    if (!g_server) return;
-    size_t len = strlen(msg);
-    httpd_ws_frame_t pkt = {
-        .type    = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)msg,
-        .len     = len,
-    };
-
-    xSemaphoreTake(xWsSem, portMAX_DELAY);
-    int count = ws_fd_count;
-    int fds[MAX_WS_CLIENTS];
-    memcpy(fds, ws_fds, count * sizeof(int));
-    xSemaphoreGive(xWsSem);
-
-    for (int i = 0; i < count; i++) {
-        httpd_ws_send_frame_async(g_server, fds[i], &pkt);
-    }
-}
-
-static void ws_broadcast_status(const char *state) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"type\":\"status\",\"state\":\"%s\"}", state);
-    ws_broadcast(buf);
-}
-
-static void ws_remove_fd(int fd) {
-    xSemaphoreTake(xWsSem, portMAX_DELAY);
-    for (int i = 0; i < ws_fd_count; i++) {
-        if (ws_fds[i] == fd) {
-            ws_fds[i] = ws_fds[--ws_fd_count];
-            break;
-        }
-    }
-    xSemaphoreGive(xWsSem);
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +427,7 @@ static void wait_until_us(int64_t target_us) {
 // ---------------------------------------------------------------------------
 static void macro_task(void *pvParameters) {
     ESP_LOGI(TAG_MACRO, "Macro starting");
-    ws_broadcast_status("running");
+    serial_send_status("running");
 
     // Snapshot config safely
     xSemaphoreTake(xCfgSem, portMAX_DELAY);
@@ -505,6 +473,7 @@ static void macro_task(void *pvParameters) {
     // -----------------------------------------------------------------------
     // Enter game — A 0.1s (this is the EonTimer start moment)
     // -----------------------------------------------------------------------
+    serial_send_status("phase1_start");  // signal EonTimer to start now
     buttons_set(BTN1_A, 0, 0);
     cursor += 100000LL; wait_until_us(cursor);
     buttons_clear(BTN1_A, 0, 0);
@@ -568,7 +537,7 @@ static void macro_task(void *pvParameters) {
     buttons_release_all();
     ESP_LOGI(TAG_MACRO, "Macro complete");
     g_macro_running = false;
-    ws_broadcast_status("idle");
+    serial_send_status("idle");
     MacroHandle = NULL;
     vTaskDelete(NULL);
 }
@@ -588,228 +557,169 @@ static void start_macro(void) {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket handler
+// UART task — reads newline-delimited JSON from serial (core 1)
 // ---------------------------------------------------------------------------
-static esp_err_t ws_handler(httpd_req_t *req) {
-    int fd = httpd_req_to_sockfd(req);
+static void uart_task(void *pvParameters) {
+    ESP_LOGI(TAG_UART, "uart_task running on core %d", xPortGetCoreID());
 
-    if (req->method == HTTP_GET) {
-        // New WebSocket connection handshake
-        xSemaphoreTake(xWsSem, portMAX_DELAY);
-        if (ws_fd_count < MAX_WS_CLIENTS) {
-            ws_fds[ws_fd_count++] = fd;
-        }
-        xSemaphoreGive(xWsSem);
-        ESP_LOGI(TAG_WS, "Client connected fd=%d", fd);
-
-        // Send current BT state immediately
-        if (bt_connected) {
-            ws_broadcast_status("ble_connected");
-        } else {
-            ws_broadcast_status("idle");
-        }
-        return ESP_OK;
-    }
-
-    // Receive frame
-    httpd_ws_frame_t pkt = { .type = HTTPD_WS_TYPE_TEXT };
-    uint8_t buf[256] = {0};
-    pkt.payload = buf;
-
-    esp_err_t ret = httpd_ws_recv_frame(req, &pkt, sizeof(buf) - 1);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG_WS, "recv failed: %d, removing client fd=%d", ret, fd);
-        ws_remove_fd(fd);
-        return ret;
-    }
-    if (pkt.type == HTTPD_WS_TYPE_CLOSE) {
-        ws_remove_fd(fd);
-        ESP_LOGI(TAG_WS, "Client disconnected fd=%d", fd);
-        return ESP_OK;
-    }
-
-    buf[pkt.len] = '\0';
-    ESP_LOGI(TAG_WS, "RX: %s", buf);
-
-    cJSON *root = cJSON_Parse((char *)buf);
-    if (!root) return ESP_OK;
-
-    cJSON *type_j = cJSON_GetObjectItemCaseSensitive(root, "type");
-    if (cJSON_IsString(type_j)) {
-        const char *type = type_j->valuestring;
-
-        if (strcmp(type, "config") == 0) {
-            xSemaphoreTake(xCfgSem, portMAX_DELAY);
-            cJSON *j;
-            j = cJSON_GetObjectItemCaseSensitive(root, "seedMs");
-            if (cJSON_IsNumber(j)) g_config.seed_ms = (int32_t)j->valuedouble;
-            j = cJSON_GetObjectItemCaseSensitive(root, "seedCalibration");
-            if (cJSON_IsNumber(j)) g_config.seed_cal = (float)j->valuedouble;
-            j = cJSON_GetObjectItemCaseSensitive(root, "continueAdvances");
-            if (cJSON_IsNumber(j)) g_config.cont_adv = (int32_t)j->valuedouble;
-            j = cJSON_GetObjectItemCaseSensitive(root, "continueCalibration");
-            if (cJSON_IsNumber(j)) g_config.cont_cal = (float)j->valuedouble;
-            xSemaphoreGive(xCfgSem);
-            nvs_save_config();
-            ESP_LOGI(TAG_WS, "Config updated: seedMs=%d seedCal=%.3f contAdv=%d contCal=%.3f",
-                     g_config.seed_ms, g_config.seed_cal,
-                     g_config.cont_adv, g_config.cont_cal);
-
-        } else if (strcmp(type, "trigger") == 0) {
-            start_macro();
-        }
-    }
-
-    cJSON_Delete(root);
-    return ESP_OK;
-}
-
-static const httpd_uri_t ws_uri = {
-    .uri          = "/ws",
-    .method       = HTTP_GET,
-    .handler      = ws_handler,
-    .is_websocket = true,
-};
-
-static void start_webserver(void) {
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = 80;
-    if (httpd_start(&g_server, &cfg) == ESP_OK) {
-        httpd_register_uri_handler(g_server, &ws_uri);
-        ESP_LOGI(TAG_WS, "WebSocket server started on port 80");
-    } else {
-        ESP_LOGE(TAG_WS, "Failed to start WebSocket server");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WiFi event handler
-// ---------------------------------------------------------------------------
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                               int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG_MAIN, "WiFi disconnected, retrying...");
-        esp_wifi_connect();
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
-        char ip[16];
-        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&ev->ip_info.ip));
-        ESP_LOGI(TAG_MAIN, "IP: %s", ip);
-        ESP_LOGI(TAG_MAIN, "WebSocket: ws://%s/ws", ip);
-        start_webserver();
-    }
-}
-
-static void wifi_init(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t inst_any, inst_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &inst_any));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &inst_ip));
-
-    wifi_config_t wifi_cfg = {
-        .sta = {
-            .ssid     = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
+    uart_config_t uart_cfg = {
+        .baud_rate  = UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG_MAIN, "WiFi connecting to %s", WIFI_SSID);
-}
+    uart_param_config(UART_PORT, &uart_cfg);
+    // RX ring buffer only; TX left to ROM console (used by ESP_LOG + uart_write_bytes)
+    uart_driver_install(UART_PORT, UART_RX_BUF, 0, 0, NULL, 0);
 
-// ---------------------------------------------------------------------------
-// BT HID callbacks
-// ---------------------------------------------------------------------------
-static void get_report_cb(uint8_t type, uint8_t id, uint16_t buffer_size) {
-    ESP_LOGI(TAG_BT, "get_report type=%d id=%d", type, id);
-}
-static void set_report_cb(uint8_t type, uint8_t id, uint16_t len, uint8_t *p) {
-    ESP_LOGI(TAG_BT, "set_report type=%d id=%d", type, id);
-}
-static void set_protocol_cb(uint8_t protocol) {
-    ESP_LOGI(TAG_BT, "set_protocol %d", protocol);
-}
-static void vc_unplug_cb(void) {
-    ESP_LOGI(TAG_BT, "vc_unplug");
-}
+    char line[256];
+    int  pos = 0;
 
-static void intr_data_cb(uint8_t report_id, uint16_t len, uint8_t *p) {
-    esp_log_buffer_hex(TAG_BT, p, len);
+    while (1) {
+        uint8_t ch;
+        int n = uart_read_bytes(UART_PORT, &ch, 1, pdMS_TO_TICKS(20));
+        if (n <= 0) continue;
+        if (ch == '\r') continue;
 
-    if (p[9] == 0x02)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply02), reply02);
-    if (p[9] == 0x08)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply08), reply08);
-    if (p[9] == 0x03)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply03), reply03);
-    if (p[9] == 0x04)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply04), reply04);
-    if (p[9] == 0x10 && p[10] ==   0 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0),    spi_reply_address_0);
-    if (p[9] == 0x10 && p[10] ==  80 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x50), spi_reply_address_0x50);
-    if (p[9] == 0x10 && p[10] == 128 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x80), spi_reply_address_0x80);
-    if (p[9] == 0x10 && p[10] == 152 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x98), spi_reply_address_0x98);
-    if (p[9] == 0x10 && p[10] ==  16 && p[11] == 128)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x10), spi_reply_address_0x10);
-    if (p[9] == 0x10 && p[10] ==  61 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x3d), spi_reply_address_0x3d);
-    if (p[9] == 0x10 && p[10] ==  32 && p[11] == 96)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x20), spi_reply_address_0x20);
-    if (p[9] == 0x22)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3401), reply3401);
-    if (p[9] == 0x40)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4001), reply4001);
-    if (p[9] == 0x48)
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4801), reply4801);
-    if (p[9] == 0x30) {
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3001), reply3001);
-    }
-    if (p[9] == 0x21 && p[10] == 0x21) {
-        esp_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3333), reply3333);
-        bt_paired = true;
-        ESP_LOGI(TAG_BT, "Paired!");
+        if (ch == '\n' || pos >= (int)sizeof(line) - 1) {
+            line[pos] = '\0';
+            pos = 0;
+            if (line[0] != '{') continue;  // skip log lines echoed back
+
+            cJSON *root = cJSON_Parse(line);
+            if (!root) continue;
+
+            cJSON *type_j = cJSON_GetObjectItemCaseSensitive(root, "type");
+            if (cJSON_IsString(type_j)) {
+                const char *type = type_j->valuestring;
+
+                if (strcmp(type, "config") == 0) {
+                    xSemaphoreTake(xCfgSem, portMAX_DELAY);
+                    cJSON *j;
+                    j = cJSON_GetObjectItemCaseSensitive(root, "seedMs");
+                    if (cJSON_IsNumber(j)) g_config.seed_ms = (int32_t)j->valuedouble;
+                    j = cJSON_GetObjectItemCaseSensitive(root, "seedCalibration");
+                    if (cJSON_IsNumber(j)) g_config.seed_cal = (float)j->valuedouble;
+                    j = cJSON_GetObjectItemCaseSensitive(root, "continueAdvances");
+                    if (cJSON_IsNumber(j)) g_config.cont_adv = (int32_t)j->valuedouble;
+                    j = cJSON_GetObjectItemCaseSensitive(root, "continueCalibration");
+                    if (cJSON_IsNumber(j)) g_config.cont_cal = (float)j->valuedouble;
+                    xSemaphoreGive(xCfgSem);
+                    nvs_save_config();
+                    ESP_LOGI(TAG_UART, "Config updated: seedMs=%d seedCal=%.3f contAdv=%d contCal=%.3f",
+                             g_config.seed_ms, g_config.seed_cal,
+                             g_config.cont_adv, g_config.cont_cal);
+
+                } else if (strcmp(type, "trigger") == 0) {
+                    start_macro();
+
+                } else if (strcmp(type, "getStatus") == 0) {
+                    serial_send_status(bt_connected ? "ble_connected" : "idle");
+                }
+            }
+            cJSON_Delete(root);
+        } else {
+            line[pos++] = (char)ch;
+        }
     }
 }
 
-static void application_cb(esp_bd_addr_t bd_addr, esp_hidd_application_state_t state) {
-    ESP_LOGI(TAG_BT, "app_state=%d", state);
-}
+// ---------------------------------------------------------------------------
+// BT HID event callback
+// ---------------------------------------------------------------------------
+static void hidd_event_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
+    switch (event) {
+    case ESP_HIDD_INIT_EVT:
+        ESP_LOGI(TAG_BT, "HIDD init status=%d", param->init.status);
+        break;
 
-static void connection_cb(esp_bd_addr_t bd_addr, esp_hidd_connection_state_t state) {
-    switch (state) {
-    case ESP_HIDD_CONN_STATE_CONNECTED:
+    case ESP_HIDD_REGISTER_APP_EVT:
+        ESP_LOGI(TAG_BT, "HIDD app registered status=%d", param->register_app.status);
+        break;
+
+    case ESP_HIDD_OPEN_EVT: {
+        esp_bd_addr_t *bd = &param->open.bd_addr;
         ESP_LOGI(TAG_BT, "Connected to %02x:%02x:%02x:%02x:%02x:%02x",
-                 bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5]);
+                 (*bd)[0], (*bd)[1], (*bd)[2], (*bd)[3], (*bd)[4], (*bd)[5]);
         esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
         if (BlinkHandle) { vTaskDelete(BlinkHandle); BlinkHandle = NULL; }
         gpio_set_level(LED_GPIO, 1);
         bt_connected = true;
-        ws_broadcast_status("ble_connected");
-        if (SendingHandle) { vTaskDelete(SendingHandle); SendingHandle = NULL; }
-        xTaskCreatePinnedToCore(send_task, "send_task", 2048, NULL, 2, &SendingHandle, 0);
+        serial_send_status("ble_connected");
         break;
-    case ESP_HIDD_CONN_STATE_DISCONNECTED:
-        ESP_LOGI(TAG_BT, "Disconnected");
+    }
+
+    case ESP_HIDD_CLOSE_EVT:
+        ESP_LOGI(TAG_BT, "Disconnected status=%d", param->close.status);
         bt_connected = false;
         bt_paired    = false;
-        ws_broadcast_status("ble_disconnected");
+        serial_send_status("ble_disconnected");
         esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
         xTaskCreate(blink_task, "blink_task", 1024, NULL, 1, &BlinkHandle);
         break;
+
+    case ESP_HIDD_GET_REPORT_EVT:
+        ESP_LOGI(TAG_BT, "get_report type=%d id=%d", param->get_report.report_type, param->get_report.report_id);
+        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                      sizeof(report30), report30);
+        break;
+
+    case ESP_HIDD_SET_REPORT_EVT:
+        ESP_LOGI(TAG_BT, "set_report type=%d id=%d", param->set_report.report_type, param->set_report.report_id);
+        break;
+
+    case ESP_HIDD_SET_PROTOCOL_EVT:
+        ESP_LOGI(TAG_BT, "set_protocol %d", param->set_protocol.protocol_mode);
+        break;
+
+    case ESP_HIDD_INTR_DATA_EVT: {
+        uint8_t *p = param->intr_data.data;
+        ESP_LOG_BUFFER_HEX(TAG_BT, p, param->intr_data.len);
+
+        if (p[9] == 0x02)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply02), reply02);
+        if (p[9] == 0x08)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply08), reply08);
+        if (p[9] == 0x03)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply03), reply03);
+        if (p[9] == 0x04)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply04), reply04);
+        if (p[9] == 0x10 && p[10] ==   0 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0),    spi_reply_address_0);
+        if (p[9] == 0x10 && p[10] ==  80 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x50), spi_reply_address_0x50);
+        if (p[9] == 0x10 && p[10] == 128 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x80), spi_reply_address_0x80);
+        if (p[9] == 0x10 && p[10] == 152 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x98), spi_reply_address_0x98);
+        if (p[9] == 0x10 && p[10] ==  16 && p[11] == 128)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x10), spi_reply_address_0x10);
+        if (p[9] == 0x10 && p[10] ==  61 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x3d), spi_reply_address_0x3d);
+        if (p[9] == 0x10 && p[10] ==  32 && p[11] == 96)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x20), spi_reply_address_0x20);
+        if (p[9] == 0x22)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3401), reply3401);
+        if (p[9] == 0x40)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4001), reply4001);
+        if (p[9] == 0x48)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4801), reply4801);
+        if (p[9] == 0x30)
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3001), reply3001);
+        if (p[9] == 0x21 && p[10] == 0x21) {
+            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3333), reply3333);
+            bt_paired = true;
+            ESP_LOGI(TAG_BT, "Paired!");
+        }
+        break;
+    }
+
+    case ESP_HIDD_VC_UNPLUG_EVT:
+        ESP_LOGI(TAG_BT, "vc_unplug");
+        break;
+
     default:
         break;
     }
@@ -838,14 +748,13 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     // Semaphores
-    xBtnSem = xSemaphoreCreateMutex();
-    xCfgSem = xSemaphoreCreateMutex();
-    xWsSem  = xSemaphoreCreateMutex();
-    memset(ws_fds, -1, sizeof(ws_fds));
+    xBtnSem    = xSemaphoreCreateMutex();
+    xCfgSem    = xSemaphoreCreateMutex();
+    xUartTxSem = xSemaphoreCreateMutex();
 
     // GPIO: LED (output) + trigger button (input pull-up)
     gpio_config_t led_cfg = {
-        .intr_type    = GPIO_PIN_INTR_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_OUTPUT,
         .pin_bit_mask = PIN_SEL,
         .pull_down_en = 0,
@@ -855,7 +764,7 @@ void app_main(void) {
     gpio_set_level(LED_GPIO, 0);
 
     gpio_config_t btn_cfg = {
-        .intr_type    = GPIO_PIN_INTR_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << TRIGGER_GPIO),
         .pull_up_en   = 1,
@@ -866,12 +775,8 @@ void app_main(void) {
     nvs_load_config();
     set_bt_address();
 
-    // Release BLE memory (we only use Classic BT)
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
-
-    // BT controller init
+    // BT controller init (BLE disabled in sdkconfig)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_bt_mem_release(ESP_BT_MODE_BLE);
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(esp_bluedroid_init());
@@ -882,7 +787,6 @@ void app_main(void) {
 
     static esp_hidd_app_param_t app_param;
     static esp_hidd_qos_param_t both_qos;
-    static esp_hidd_callbacks_t callbacks;
 
     app_param.name          = "Wireless Gamepad";
     app_param.description   = "Gamepad";
@@ -892,35 +796,30 @@ void app_main(void) {
     app_param.desc_list_len = sizeof(hid_descriptor);
     memset(&both_qos, 0, sizeof(both_qos));
 
-    callbacks.application_state_cb = application_cb;
-    callbacks.connection_state_cb  = connection_cb;
-    callbacks.get_report_cb        = get_report_cb;
-    callbacks.set_report_cb        = set_report_cb;
-    callbacks.set_protocol_cb      = set_protocol_cb;
-    callbacks.intr_data_cb         = intr_data_cb;
-    callbacks.vc_unplug_cb         = vc_unplug_cb;
-
     esp_bt_cod_t cod = { .minor = 2, .major = 5, .service = 1 };
     esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
 
-    esp_hid_device_register_app(&app_param, &both_qos, &both_qos);
-    esp_hid_device_init(&callbacks);
-    esp_bt_dev_set_device_name("Pro Controller");
-    esp_bt_gap_set_pin(ESP_BT_PIN_TYPE_FIXED, 4, (uint8_t *)"0000");
+    esp_bt_hid_device_register_callback(hidd_event_cb);
+    esp_bt_hid_device_init();
+    esp_bt_hid_device_register_app(&app_param, &both_qos, &both_qos);
+    esp_bt_gap_set_device_name("Pro Controller");
+    uint8_t pin[16] = { '0', '0', '0', '0' };
+    esp_bt_gap_set_pin(ESP_BT_PIN_TYPE_FIXED, 4, pin);
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
 
+    // Core 0: BT send task
     xTaskCreate(blink_task, "blink_task", 1024, NULL, 1, &BlinkHandle);
+    xTaskCreatePinnedToCore(send_task, "send_task", 4096, NULL, 2, &SendingHandle, 0);
 
-    // WiFi (must happen after BT init to avoid memory conflicts)
-    wifi_init();
+    // Core 1: UART communication task
+    xTaskCreatePinnedToCore(uart_task, "uart_task", 4096, NULL, 3, NULL, 1);
 
-    ESP_LOGI(TAG_MAIN, "Ready. Waiting for Switch to pair...");
+    ESP_LOGI(TAG_MAIN, "Ready. Connect EonTimer via USB serial at %d baud.", UART_BAUD);
 
     // Main loop: poll physical trigger button (active LOW)
     bool btn_prev = true;
     while (1) {
         bool btn_now = gpio_get_level(TRIGGER_GPIO);
-        // Falling edge = button pressed
         if (btn_prev && !btn_now) {
             ESP_LOGI(TAG_MAIN, "Physical trigger pressed");
             start_macro();

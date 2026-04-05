@@ -4,11 +4,9 @@ idf_component_register(
     REQUIRES
         bt
         nvs_flash
-        esp_wifi
-        esp_netif
-        esp_event
-        esp_http_server
-        json
         driver
+        esp_driver_gpio
+        esp_driver_uart
         esp_timer
+        cjson
 )
